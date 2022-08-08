@@ -16,4 +16,5 @@ target_link_libraries(gputrasher
         # These should already be in the default search directory.
         d3d12.lib
         DXGI.lib
+        D3DCompiler.lib
 )
