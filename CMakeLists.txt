@@ -1,10 +1,19 @@
 # Copyright (c) 2022 Advanced Micro Devices, Inc. All rights reserved. #
 
-devdriver_executable(gpuTrasher WIN32)
+cmake_minimum_required(VERSION 3.15)
 
-install(TARGETS gpuTrasher DESTINATION bin)
+project(GpuTrasher)
 
-target_sources(gpuTrasher
+add_executable(gputrasher WIN32)
+
+target_sources(gputrasher
     PRIVATE
-        main.cpp
+        src/hello-triangle.cpp
+)
+
+target_link_libraries(gputrasher
+    PRIVATE
+        # These should already be in the default search directory.
+        d3d12.lib
+        DXGI.lib
 )
