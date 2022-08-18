@@ -26,6 +26,13 @@ struct Vertex
     XMFLOAT4 color;
 };
 
+static const size_t s_ColorCount = 4096;
+struct ConstBuffer
+{
+    // error X3059: array dimension must be between 1 and 65536
+    XMFLOAT4 colors[s_ColorCount];
+};
+
 struct Pipeline
 {
     // pipeline objects
@@ -37,6 +44,7 @@ struct Pipeline
     ComPtr<ID3D12CommandAllocator> cmdAlloc;
     ComPtr<ID3D12CommandQueue> cmdQueue;
     ComPtr<ID3D12DescriptorHeap> rtvDescriptorHeap;
+    ComPtr<ID3D12DescriptorHeap> cbvDescriptorHeap;
     UINT rtvDescriptorSize;
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
@@ -45,6 +53,9 @@ struct Pipeline
     // app resource
     ComPtr<ID3D12Resource> vertexBuffer;
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+    ComPtr<ID3D12Resource> constantBuffer;
+    UINT* pConstBufferMappedBeginAddr;
+    ConstBuffer* pConstBufferData;
 
     // synchronization
     UINT frameIndex;
@@ -159,7 +170,7 @@ static void LoadPipeline(Pipeline* pPipeline, HWND hwnd)
         ThrowIfFailed(debugController->QueryInterface(IID_PPV_ARGS(&debugController1)));
 
         debugController1->EnableDebugLayer();
-        debugController1->SetEnableGPUBasedValidation(TRUE);
+        // debugController1->SetEnableGPUBasedValidation(TRUE);
 
         dxgiFactoryFlag |= DXGI_CREATE_FACTORY_DEBUG;
     }
@@ -225,6 +236,17 @@ static void LoadPipeline(Pipeline* pPipeline, HWND hwnd)
         pPipeline->rtvDescriptorSize =
             pPipeline->device->GetDescriptorHandleIncrementSize(
                 D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+        // Describe and create a constant buffer view (CBV) descriptor heap.
+        // Flags indicate that this descriptor heap can be bound to the pipeline
+        // and that descriptors contained in it can be referenced by a root table.
+        D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc = {};
+        cbvHeapDesc.NumDescriptors = 1;
+        cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        ThrowIfFailed(pPipeline->device->CreateDescriptorHeap(
+            &cbvHeapDesc,
+            IID_PPV_ARGS(&pPipeline->cbvDescriptorHeap)));
     }
 
     // Create frame resource.
@@ -256,23 +278,54 @@ static void LoadPipeline(Pipeline* pPipeline, HWND hwnd)
 
 static void LoadAssets(Pipeline* pPipeline)
 {
-    // Create an empty root signature.
+    // Create a root signature consisting of a descriptor table with a single CBV.
     {
-        CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
-        rootSignatureDesc.Init(
-            0, // number of parameters
-            nullptr, // parameter array
-            0, // number of static samplers
-            nullptr, // static sampler array
-            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+        D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+
+        // This is the highest version the sample supports. If
+        // CheckFeatureSupport succeeds, the HighestVersion returned will not
+        // be greater than this.
+        featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+
+        HRESULT hr = pPipeline->device->CheckFeatureSupport(
+            D3D12_FEATURE_ROOT_SIGNATURE,
+            &featureData,
+            sizeof(featureData));
+
+        if (FAILED(hr))
+        {
+            featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        }
+
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[1] = {};
+        CD3DX12_ROOT_PARAMETER1 rootParameters[1] = {};
+
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
+
+        // Allow input layout and deny uneccessary access to certain pipeline stages.
+        D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 0, nullptr, rootSignatureFlags);
 
         ComPtr<ID3DBlob> signature;
         ComPtr<ID3DBlob> error;
-        ThrowIfFailed(D3D12SerializeRootSignature(
+        hr = D3DX12SerializeVersionedRootSignature(
             &rootSignatureDesc,
-            D3D_ROOT_SIGNATURE_VERSION_1,
+            featureData.HighestVersion,
             &signature,
-            &error));
+            &error);
+        if (FAILED(hr))
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+            throw std::exception();
+        }
 
         ThrowIfFailed(pPipeline->device->CreateRootSignature(
             0,
@@ -288,7 +341,7 @@ static void LoadAssets(Pipeline* pPipeline)
 
 #if defined(_DEBUG)
         // Enable better shader debugging with the graphics debugging tools.
-        UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+        UINT compileFlags = 0; // D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #else
         UINT compileFlag = 0;
 #endif
@@ -414,6 +467,52 @@ static void LoadAssets(Pipeline* pPipeline)
         pPipeline->vertexBufferView.SizeInBytes = vertexBufferSize;
     }
 
+    // Create constant buffer.
+    {
+        const UINT constBufferSize = sizeof(ConstBuffer);
+
+        ThrowIfFailed(pPipeline->device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(constBufferSize),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&pPipeline->constantBuffer)));
+
+        // Describe and create a constant buffer view.
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        cbvDesc.BufferLocation = pPipeline->constantBuffer->GetGPUVirtualAddress();
+        cbvDesc.SizeInBytes = constBufferSize;
+        pPipeline->device->CreateConstantBufferView(
+            &cbvDesc, pPipeline->cbvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+        pPipeline->pConstBufferData = (ConstBuffer*)malloc(constBufferSize);
+        memset(pPipeline->pConstBufferData, 0, constBufferSize);
+        pPipeline->pConstBufferData->colors[0] = XMFLOAT4(1.0f, 0.0f, 0.0f, 0.0f);
+        pPipeline->pConstBufferData->colors[1] = XMFLOAT4(0.0f, 1.0f, 0.0f, 1.0f);
+        pPipeline->pConstBufferData->colors[2] = XMFLOAT4(0.0f, 0.0f, 1.0f, 1.0f);
+        pPipeline->pConstBufferData->colors[3] = XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
+        pPipeline->pConstBufferData->colors[s_ColorCount - 1] = XMFLOAT4(0.0f, 1.0f, 1.0f, 1.0f);
+
+        // Map and initialize the constant buffer. We don't unmap this until the
+        // app closes. Keeping things mapped for the lifetime of the resource is okay.
+        CD3DX12_RANGE readRange(0, 0); // We do not intend to read from this resource on the CPU.
+        ThrowIfFailed(pPipeline->constantBuffer->Map(
+            0,
+            &readRange,
+            reinterpret_cast<void**>(&pPipeline->pConstBufferMappedBeginAddr)));
+
+        memcpy(
+            pPipeline->pConstBufferMappedBeginAddr,
+            pPipeline->pConstBufferData,
+            constBufferSize);
+
+        // memcpy(
+        //     &pPipeline->pConstBufferMappedBeginAddr,
+        //     pPipeline->pConstBufferData,
+        //     constBufferSize);
+    }
+
     // Create synchronization objects and wait until assets have been uploaded to the GPU.
     {
         pPipeline->fenceValue = 0;
@@ -451,8 +550,17 @@ static void PopulateCommandList(Pipeline* pPipeline)
         pPipeline->cmdAlloc.Get(),
         pPipeline->pipelineState.Get()));
 
-    // Set necessary state.
-    pPipeline->cmdList->SetGraphicsRootSignature(pPipeline->rootSignature.Get());
+    // Set necessary states.
+    {
+        pPipeline->cmdList->SetGraphicsRootSignature(pPipeline->rootSignature.Get());
+
+        ID3D12DescriptorHeap* ppHeaps[] = { pPipeline->cbvDescriptorHeap.Get() };
+        pPipeline->cmdList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+        pPipeline->cmdList->SetGraphicsRootDescriptorTable(
+            0,
+            pPipeline->cbvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    }
+
     pPipeline->cmdList->RSSetViewports(1, &pPipeline->viewport);
     pPipeline->cmdList->RSSetScissorRects(1, &pPipeline->scissorRect);
 
@@ -512,6 +620,7 @@ static void Destroy(Pipeline* pPipeline)
 {
     WaitForPreviousFrame(pPipeline);
     CloseHandle(pPipeline->fenceEvent);
+    free(pPipeline->pConstBufferData);
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nShowCmd)
@@ -530,7 +639,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     RECT windowRect = { 0, 0, s_RenderWidth, s_RenderHeight };
     AdjustWindowRect(&windowRect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    Pipeline pipeline;
+    Pipeline pipeline = {};
 
     HWND hwnd = CreateWindowA(
         windowClass.lpszClassName,
@@ -589,6 +698,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     case WM_PAINT:
     {
         Render(pPipeline);
+        return 0;
     } break;
 
     case WM_DESTROY:
