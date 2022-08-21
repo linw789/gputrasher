@@ -9,6 +9,8 @@ add_executable(gputrasher WIN32)
 target_sources(gputrasher
     PRIVATE
         src/hello-triangle.cpp
+        src/utils.cpp
+        src/utils.h
 )
 
 target_link_libraries(gputrasher

@@ -12,6 +12,7 @@
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
 #include "d3dx12.h"
+#include "utils.h"
 
 using namespace Microsoft::WRL;
 using namespace DirectX;
@@ -75,45 +76,6 @@ inline void ThrowIfFailed(HRESULT hr)
 
 // Main message handler for the app.
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-
-static HRESULT FindD3D12HardwareAdapter(
-    ComPtr<IDXGIFactory4> factory,
-    ComPtr<IDXGIAdapter1> outAdapter)
-{
-    HRESULT hr = E_NOINTERFACE;
-
-    ComPtr<IDXGIAdapter1> adapter;
-
-    for (UINT adapterIdx = 0;
-        SUCCEEDED(factory->EnumAdapters1(adapterIdx, &adapter));
-        ++adapterIdx)
-    {
-        DXGI_ADAPTER_DESC1 desc = {};
-        adapter->GetDesc1(&desc);
-
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-        {
-            // Skip software adapter.
-            continue;
-        }
-
-        // Check D3D12 support without creating a device.
-        hr = D3D12CreateDevice(
-            adapter.Get(),
-            D3D_FEATURE_LEVEL_12_0,
-            _uuidof(ID3D12Device),
-            nullptr);
-
-        if (SUCCEEDED(hr))
-        {
-            outAdapter = adapter.Detach();
-            hr = S_OK;
-            break;
-        }
-    }
-
-    return hr;
-}
 
 static void WaitForPreviousFrame(Pipeline* pPipeline)
 {
@@ -488,7 +450,7 @@ static void LoadAssets(Pipeline* pPipeline)
 
         pPipeline->pConstBufferData = (ConstBuffer*)malloc(constBufferSize);
         memset(pPipeline->pConstBufferData, 0, constBufferSize);
-        pPipeline->pConstBufferData->colors[0] = XMFLOAT4(1.0f, 0.0f, 0.0f, 0.0f);
+        pPipeline->pConstBufferData->colors[0] = XMFLOAT4(65535.0f + 1.0f, 0.0f, 0.0f, 0.0f);
         pPipeline->pConstBufferData->colors[1] = XMFLOAT4(0.0f, 1.0f, 0.0f, 1.0f);
         pPipeline->pConstBufferData->colors[2] = XMFLOAT4(0.0f, 0.0f, 1.0f, 1.0f);
         pPipeline->pConstBufferData->colors[3] = XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
@@ -506,6 +468,8 @@ static void LoadAssets(Pipeline* pPipeline)
             pPipeline->pConstBufferMappedBeginAddr,
             pPipeline->pConstBufferData,
             constBufferSize);
+
+        pPipeline->constantBuffer->Release();
 
         // memcpy(
         //     &pPipeline->pConstBufferMappedBeginAddr,
